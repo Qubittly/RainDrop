@@ -1,11 +1,12 @@
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::RwLock;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{RwLock, mpsc};
+use tokio::net::TcpListener;
 use std::error::Error;
 use std::net::SocketAddr;
 use std::collections::{HashSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 const MAX_FILE_SIZE: u64 = 1024 * 1024 * 10; // 10 MB
 const MAX_MEMBERS: usize = 10;
@@ -172,6 +173,7 @@ impl User {
 struct AppState {
     groups: RwLock<HashMap<String, Group>>,
     users: RwLock<HashMap<String, User>>,
+    clients: RwLock<HashMap<String, mpsc::Sender<OutgoingData>>>,
 }
 
 impl AppState {
@@ -179,6 +181,7 @@ impl AppState {
         Arc::new(AppState {
             groups: RwLock::new(HashMap::new()),
             users: RwLock::new(HashMap::new()),
+            clients: RwLock::new(HashMap::new()),
         })
     }
 
@@ -209,6 +212,57 @@ impl AppState {
         let mut users = self.users.write().await;
         users.insert(user.username.clone(), user);
     }
+
+    async fn register_client(&self, username: String, sender: mpsc::Sender<OutgoingData>) {
+        let mut clients = self.clients.write().await;
+        clients.insert(username, sender);
+    }
+
+    async fn remove_client(&self, username: &str, sender: &mpsc::Sender<OutgoingData>) {
+        let mut clients = self.clients.write().await;
+        if clients
+            .get(username)
+            .is_some_and(|current| current.same_channel(sender))
+        {
+            clients.remove(username);
+        }
+    }
+
+    async fn send_to(&self, username: &str, data: Vec<u8>, addr: SocketAddr) -> bool {
+        let sender = {
+            let clients = self.clients.read().await;
+            clients.get(username).cloned()
+        };
+
+        match sender {
+            Some(sender) => sender.send(OutgoingData { data, addr }).await.is_ok(),
+            None => false,
+        }
+    }
+}
+
+struct OutgoingData {
+    data: Vec<u8>,
+    addr: SocketAddr,
+}
+
+#[derive(Debug, Deserialize)]
+enum ClientMessage {
+    Identify { username: String },
+    Send { to: String, message: String },
+}
+
+#[derive(Serialize)]
+enum ServerMessage {
+    Identified { username: String },
+    Message { from: String, message: String },
+    Error { message: String },
+}
+
+fn encode_message(message: ServerMessage) -> Result<Vec<u8>, serde_json::Error> {
+    let mut data = serde_json::to_vec(&message)?;
+    data.push(b'\n');
+    Ok(data)
 }
 
 #[tokio::main]
@@ -217,10 +271,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|_| "127.0.0.1:8082".to_string());
     let listener = TcpListener::bind(&server_addr).await?;
 
-    let mut state = AppState::new();
+    let state = AppState::new();
     loop {
         let (socket, addr) = listener.accept().await?;
-        let mut state = state.clone();
+        let state = state.clone();
 
         tokio::spawn(async move {
             println!("Accepted connection from {}", addr);
@@ -233,7 +287,41 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (reader, writer) = tokio::io::split(socket);
+    let (reader, mut writer) = tokio::io::split(socket);
+    let mut lines = BufReader::new(reader).lines();
 
-    
+    let username = match lines.next_line().await {
+        Ok(Some(line)) => match serde_json::from_str::<ClientMessage>(&line) {
+            Ok(ClientMessage::Identify { username }) => {
+                if !username.trim().is_empty() {
+                    username
+                } else {
+                    let error_message = ServerMessage::Error {
+                        message: "Username cannot be empty".to_string(),
+                    };
+                    let encoded = encode_message(error_message).unwrap();
+                    writer.write_all(&encoded).await.unwrap();
+                    return;
+                }
+            }
+            _ => {
+                let error_message = ServerMessage::Error {
+                    message: "The first line must be an identification message".to_string(),
+                };
+                let encoded = encode_message(error_message).unwrap();
+                writer.write_all(&encoded).await.unwrap();
+                return;
+            }
+        }
+        _ => {
+            let error_message = ServerMessage::Error {
+                message: "Invalid identification message".to_string(),
+            };
+            let encoded = encode_message(error_message).unwrap();
+            writer.write_all(&encoded).await.unwrap();
+            return;
+        }
+    };
+
+
 }
