@@ -1,4 +1,5 @@
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::RwLock;
 use tokio::net::{TcpListener, TcpStream};
 use std::error::Error;
 use std::net::SocketAddr;
@@ -10,6 +11,7 @@ const MAX_FILE_SIZE: u64 = 1024 * 1024 * 10; // 10 MB
 const MAX_MEMBERS: usize = 10;
 
 /// Represents metadata for a file in the network.
+#[derive(Default, Clone)]
 struct FileMetadata {
     name: String,
     size: u64,
@@ -20,7 +22,7 @@ struct FileMetadata {
 }
 
 /// Represents a peer in the network.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Peer {
     username: String,
     ip_address: String,
@@ -48,7 +50,7 @@ impl Peer {
 }
 
 /// Represents a group in the network.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Group {
     name: String,
     owner: String,
@@ -94,7 +96,7 @@ impl Group {
 }
 
 /// Represents a user in the network.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct User {
     username: String,
     groups: HashSet<String>,
@@ -168,16 +170,44 @@ impl User {
 }
 /// Represents the application state.
 struct AppState {
-    groups: Arc<Mutex<HashMap<String, Group>>>,
-    users: Arc<Mutex<HashMap<String, User>>>,
+    groups: RwLock<HashMap<String, Group>>,
+    users: RwLock<HashMap<String, User>>,
 }
 
 impl AppState {
-    fn new() -> Self {
-        AppState {
-            groups: Arc::new(Mutex::new(HashMap::new())),
-            users: Arc::new(Mutex::new(HashMap::new())),
-        }
+    fn new() -> Arc<Self> {
+        Arc::new(AppState {
+            groups: RwLock::new(HashMap::new()),
+            users: RwLock::new(HashMap::new()),
+        })
+    }
+
+    async fn get_groups(&self) -> HashMap<String, Group> {
+        self.groups.read().await.clone()
+    }
+
+    async fn get_group(&self, group_name: &str) -> Option<Group> {
+        let groups = self.groups.read().await;
+        groups.get(group_name).cloned()
+    }
+
+    async fn add_group(&self, group: Group) {
+        let mut groups = self.groups.write().await;
+        groups.insert(group.name.clone(), group);
+    }
+
+    async fn get_users(&self) -> HashMap<String, User> {
+        self.users.read().await.clone()
+    }
+
+    async fn get_user(&self, username: &str) -> Option<User> {
+        let users = self.users.read().await;
+        users.get(username).cloned()
+    }
+
+    async fn add_user(&self, user: User) {
+        let mut users = self.users.write().await;
+        users.insert(user.username.clone(), user);
     }
 }
 
@@ -187,18 +217,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|_| "127.0.0.1:8082".to_string());
     let listener = TcpListener::bind(&server_addr).await?;
 
-    let state = Arc::new(Mutex::new(AppState::new()));
+    let mut state = AppState::new();
     loop {
         let (socket, addr) = listener.accept().await?;
+        let mut state = state.clone();
 
         tokio::spawn(async move {
             println!("Accepted connection from {}", addr);
-            handle_connection(socket, addr).await;
+            handle_connection(socket, addr, state).await;
         });
     }
 }
 
-async fn handle_connection<S>(socket: S, addr: SocketAddr) 
+async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>) 
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
