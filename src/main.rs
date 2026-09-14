@@ -228,14 +228,14 @@ impl AppState {
         }
     }
 
-    async fn send_to(&self, username: &str, data: Vec<u8>, addr: SocketAddr) -> bool {
+    async fn send_to(&self, username: &str, data: Vec<u8>) -> bool {
         let sender = {
             let clients = self.clients.read().await;
             clients.get(username).cloned()
         };
 
         match sender {
-            Some(sender) => sender.send(OutgoingData { data, addr }).await.is_ok(),
+            Some(sender) => sender.send(OutgoingData { data }).await.is_ok(),
             None => false,
         }
     }
@@ -243,7 +243,6 @@ impl AppState {
 
 struct OutgoingData {
     data: Vec<u8>,
-    addr: SocketAddr,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,5 +322,68 @@ where
         }
     };
 
+    let (sender, mut reciever) = mpsc::channel::<OutgoingData>(100);
+    state.register_client(username.clone(), sender.clone()).await;
+    let user = User::new(
+        username.clone(),
+        addr.ip().to_string(), 
+        addr.port()
+    );
+    state.add_user(user).await;
 
+    // Spawn a task to handle outgoing messages to the client
+    // This task will listen for messages sent to this client and write them to the socket
+    let writer_task = tokio::spawn (async move {
+        while let Some(outgoing) = reciever.recv().await {
+            if writer.write_all(&outgoing.data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    if let Ok(data) = encode_message(ServerMessage::Identified { 
+        username: username.clone() 
+    }) {
+        // Send the identification confirmation message to the client
+        let _  = sender.send(OutgoingData { data }).await;
+    }
+
+    while let Ok(Some(line)) = lines.next_line().await {
+        let message = match serde_json::from_str::<ClientMessage>(&line) {
+            Ok(message) => message,
+            Err(_) => {
+                if let Ok(data) = encode_message(ServerMessage::Error {
+                    message: "invalid JSON message".to_string(),
+                }) {
+                    let _ = sender.send(OutgoingData { data }).await;
+                }
+                continue;
+            }
+        };
+
+        match message {
+            ClientMessage::Identify { .. } => {
+                if let Ok(data) = encode_message(ServerMessage::Error {
+                    message: "the username can only be sent once".to_string(),
+                }) {
+                    let _ = sender.send(OutgoingData { data }).await;
+                }
+            }
+            ClientMessage::Send { to, message } => {
+                let data = encode_message(ServerMessage::Message {
+                    from: username.clone(),
+                    message,
+                });
+                if let Ok(data) = data {
+                    if !state.send_to(&to, data).await {
+                        if let Ok(error) = encode_message(ServerMessage::Error {
+                            message: format!("user {to} is not connected"),
+                        }) {
+                            let _ = sender.send(OutgoingData { data: error }).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
