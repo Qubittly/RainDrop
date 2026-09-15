@@ -8,7 +8,6 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-const MAX_FILE_SIZE: u64 = 1024 * 1024 * 10; // 10 MB
 const MAX_MEMBERS: usize = 10;
 
 /// Represents metadata for a file in the network.
@@ -17,6 +16,7 @@ struct FileMetadata {
     name: String,
     size: u64,
     path: String,
+    mime_type: String,
     owner: String,
     shared_with: HashSet<String>,
     timestamp: chrono::DateTime<Utc>,
