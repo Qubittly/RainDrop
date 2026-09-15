@@ -324,15 +324,20 @@ where
 
     let (sender, mut reciever) = mpsc::channel::<OutgoingData>(100);
     state.register_client(username.clone(), sender.clone()).await;
-    let user = User::new(
-        username.clone(),
-        addr.ip().to_string(), 
-        addr.port()
-    );
-    state.add_user(user).await;
+    let mut user = match state.get_user(&username).await {
+        Some(mut user) => {
+            user.set_online(true);
+            user.set_ip_address(addr.ip().to_string());
+            user.set_port(addr.port());
+            user
+        }
+        None => User::new(username.clone(), addr.ip().to_string(), addr.port()),
+    };
+    state.add_user(user.clone()).await;
 
     // Spawn a task to handle outgoing messages to the client
-    // This task will listen for messages sent to this client and write them to the socket
+    // This task will listen for messages sent to this client 
+    // (Draiing the receiver channel) and writing to the socket in a loop
     let writer_task = tokio::spawn (async move {
         while let Some(outgoing) = reciever.recv().await {
             if writer.write_all(&outgoing.data).await.is_err() {
@@ -386,4 +391,12 @@ where
             }
         }
     }
+    // Stop accepting messages from the client and close the connection
+    state.remove_client(&username, &sender).await;
+
+    user.set_online(false);
+    state.add_user(user).await;
+
+    drop(sender);
+    let _ = writer_task.await;
 }
