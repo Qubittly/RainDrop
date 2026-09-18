@@ -164,11 +164,11 @@ impl User {
     }
 }
 
-pub struct OutgoingData {
+pub struct Data {
     pub data: Vec<u8>,
 }
 
-impl OutgoingData {
+impl Data {
     pub fn new(data: Vec<u8>) -> Self {
         Self { data }
     }

@@ -1,13 +1,16 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{ RwLock, mpsc };
-use crate::types::{ Group, User, OutgoingData };
+use crate::types::{ Group, User, Data };
+use crate::transfer::TransferState;
+use uuid::Uuid;
 
 /// Represents the application state.
 pub struct AppState {
     groups: RwLock<HashMap<String, Group>>,
     users: RwLock<HashMap<String, User>>,
-    clients: RwLock<HashMap<String, mpsc::Sender<OutgoingData>>>,
+    clients: RwLock<HashMap<String, mpsc::Sender<Data>>>,
+    active_transfers: Arc<RwLock<HashMap<Uuid, Arc<RwLock<TransferState>>>>>,
 }
 
 impl AppState {
@@ -16,6 +19,7 @@ impl AppState {
             groups: RwLock::new(HashMap::new()),
             users: RwLock::new(HashMap::new()),
             clients: RwLock::new(HashMap::new()),
+            active_transfers: Default::default(),
         })
     }
 
@@ -47,16 +51,12 @@ impl AppState {
         users.insert(user.username.clone(), user);
     }
 
-    pub async fn register_client(
-        &self,
-        username: String,
-        sender: mpsc::Sender<OutgoingData>
-    ) {
+    pub async fn register_client(&self, username: String, sender: mpsc::Sender<Data>) {
         let mut clients = self.clients.write().await;
         clients.insert(username, sender);
     }
 
-    pub async fn remove_client(&self, username: &str, sender: &mpsc::Sender<OutgoingData>) {
+    pub async fn remove_client(&self, username: &str, sender: &mpsc::Sender<Data>) {
         let mut clients = self.clients.write().await;
         if clients.get(username).is_some_and(|current| current.same_channel(sender)) {
             clients.remove(username);
@@ -70,7 +70,7 @@ impl AppState {
         };
 
         match sender {
-            Some(sender) => sender.send(OutgoingData::new(data)).await.is_ok(),
+            Some(sender) => sender.send(Data::new(data)).await.is_ok(),
             None => false,
         }
     }

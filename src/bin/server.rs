@@ -5,7 +5,7 @@ use tokio::io::{ AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReade
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use raindrop::{ AppState, ClientMessage, OutgoingData, ServerMessage, User, encode_message };
+use raindrop::{ AppState, ClientMessage, Data, ServerMessage, User, encode_message };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -64,7 +64,7 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
         }
     };
 
-    let (sender, mut reciever) = mpsc::channel::<OutgoingData>(100);
+    let (sender, mut reciever) = mpsc::channel::<Data>(100);
     state.register_client(username.clone(), sender.clone()).await;
     let mut user = match state.get_user(&username).await {
         Some(mut user) => {
@@ -94,7 +94,7 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
         })
     {
         // Send the identification confirmation message to the client
-        let _ = sender.send(OutgoingData { data }).await;
+        let _ = sender.send(Data { data }).await;
     }
 
     while let Ok(Some(line)) = lines.next_line().await {
@@ -106,7 +106,7 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
                         message: "invalid JSON message".to_string(),
                     })
                 {
-                    let _ = sender.send(OutgoingData { data }).await;
+                    let _ = sender.send(Data { data }).await;
                 }
                 continue;
             }
@@ -119,7 +119,7 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
                         message: "the username can only be sent once".to_string(),
                     })
                 {
-                    let _ = sender.send(OutgoingData { data }).await;
+                    let _ = sender.send(Data { data }).await;
                 }
             }
             ClientMessage::Send { to, message } => {
@@ -134,7 +134,7 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
                                 message: format!("user {to} is not connected"),
                             })
                         {
-                            let _ = sender.send(OutgoingData { data: error }).await;
+                            let _ = sender.send(Data { data: error }).await;
                         }
                     }
                 }
