@@ -1,93 +1,157 @@
-use std::path::PathBuf;
+use std::{ path::{ Path, PathBuf }, sync::Arc };
 
 use axum::{
-    Router,
-    extract::{ DefaultBodyLimit, Multipart, Path, Query, State, ws::WebSocketUpgrade },
-    http::{ HeaderMap, StatusCode, header },
-    response::IntoResponse,
-    routing::{ get, post },
     Json,
+    Router,
+    body::Body,
+    extract::{ DefaultBodyLimit, Multipart, Path as AxumPath, State },
+    http::{ StatusCode, header },
+    response::{ IntoResponse, Response },
+    routing::{ get, post },
 };
-use ratatui::macros;
 use serde::Serialize;
-use tokio::fs;
-use tokio::sync::broadcast;
+use tokio::{ fs, io::AsyncWriteExt };
+use tokio_util::io::ReaderStream;
+use uuid::Uuid;
 
-use crate::Data;
-use crate::AppState;
+use crate::{ AppState, FileMetadata };
 
-const MAX_FILE_SIZE: u64 = 1024 * 1024 * 10; // 10 MB
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+const UPLOAD_DIRECTORY: &str = "uploads";
 
 pub struct TransferState {
-    file_name: String,
-    size: u64,
-    bytes_transferred: u64,
-    status: TransferStatus,
-    /// Piping Data from uploader to downloader
-    data_tx: broadcast::Sender<Data>,
+    pub(crate) file_meta: FileMetadata,
+}
+
+impl TransferState {
+    fn new(file_meta: FileMetadata) -> Self {
+        Self { file_meta }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransferStatus {
     Waiting,
-    InTransfer,
+    Transferring,
     Completed,
     Failed,
 }
 
-fn mime_type(path: &PathBuf) -> String {
-    match path.extension().and_then(|ext| ext.to_str()) {
-        Some("jpg") | Some("jpeg") => "image/jpeg".to_string(),
-        Some("png") => "image/png".to_string(),
-        Some("gif") => "image/gif".to_string(),
-        Some("mp4") => "video/mp4".to_string(),
-        Some("mp3") => "audio/mpeg".to_string(),
-        Some("txt") => "text/plain".to_string(),
-        Some("html") => "text/html".to_string(),
-        Some("pdf") => "application/pdf".to_string(),
-        Some("json") => "application/json".to_string(),
-        _ => "application/octet-stream".to_string(), // Default MIME type
-    }
+#[derive(Debug, Serialize)]
+pub struct UploadResponse {
+    pub id: Uuid,
+    pub file_name: String,
+    pub size: u64,
+    pub download_path: String,
 }
 
-async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(
-        |socket| async move {
-            //TODO: Handle the WebSocket connection
-        }
-    )
+/// Build the HTTP routes used for large-file transfers.
+pub fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/transfers", post(upload_file))
+        .route("/transfers/{id}", get(download_file))
+        .layer(DefaultBodyLimit::max((MAX_FILE_SIZE + 1024 * 1024) as usize))
+        .with_state(state)
 }
 
-async fn upload_file(State(state): State<AppState>, mut multipart: Multipart) -> impl IntoResponse {
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let file_name = field.file_name().unwrap_or("file").to_owned();
-        let _content_type = field.content_type().unwrap_or("application/octet-stream").to_owned();
-        let data = field.bytes().await.unwrap();
+async fn upload_file(
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart
+) -> Result<Json<UploadResponse>, Response> {
+    fs::create_dir_all(UPLOAD_DIRECTORY).await.map_err(internal_error)?;
 
-        if (data.len() as u64) > MAX_FILE_SIZE {
-            return (StatusCode::BAD_REQUEST, "File size exceeds the limit").into_response();
+    let mut upload = None;
+    while let Some(mut field) = multipart.next_field().await.map_err(bad_request)? {
+        let Some(raw_name) = field.file_name() else {
+            continue;
+        };
+        let file_name = safe_file_name(raw_name);
+        let content_type = field.content_type().unwrap_or("application/octet-stream").to_owned();
+        let id = Uuid::new_v4();
+        let file_path = PathBuf::from(UPLOAD_DIRECTORY).join(format!("{id}.upload"));
+        let mut file = fs::File::create(&file_path).await.map_err(internal_error)?;
+        let mut size = 0;
+
+        while let Some(chunk) = field.chunk().await.map_err(bad_request)? {
+            size += chunk.len() as u64;
+            if size > MAX_FILE_SIZE {
+                let _ = fs::remove_file(&file_path).await;
+                return Err(
+                    (StatusCode::PAYLOAD_TOO_LARGE, "file exceeds the 10 MiB limit").into_response()
+                );
+            }
+            file.write_all(&chunk).await.map_err(internal_error)?;
         }
+        file.flush().await.map_err(internal_error)?;
 
-        let file_path = PathBuf::from(format!("./uploads/{}", file_name));
-        fs::write(&file_path, &data).await.unwrap();
-
-        //TODO: Add logic to update the state with the new file metadata
+        let file_meta = FileMetadata::new(
+            file_name.clone(),
+            size,
+            file_path.to_string_lossy().into_owned(),
+            content_type
+        );
+        state.add_transfer(id, TransferState::new(file_meta)).await;
+        upload = Some(UploadResponse {
+            id,
+            file_name,
+            size,
+            download_path: format!("/transfers/{id}"),
+        });
+        break;
     }
 
-    (StatusCode::OK, "File uploaded successfully").into_response()
+    upload
+        .map(Json)
+        .ok_or_else(||
+            (StatusCode::BAD_REQUEST, "multipart request did not contain a file").into_response()
+        )
 }
 
 async fn download_file(
-    State(state): State<AppState>,
-    Path(file_name): Path<String>
-) -> impl IntoResponse {
-    let file_path = PathBuf::from(format!("./uploads/{}", file_name));
-    if !file_path.exists() {
-        return (StatusCode::NOT_FOUND, "File not found").into_response();
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<Uuid>
+) -> Result<Response, Response> {
+    let transfer = state
+        .get_transfer(&id).await
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
+    let transfer = transfer.read().await;
+    let file = fs::File
+        ::open(&transfer.file_meta.path).await
+        .map_err(|_| StatusCode::NOT_FOUND.into_response())?;
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+    let disposition = format!("attachment; filename=\"{}\"", transfer.file_meta.name);
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, &transfer.file_meta.mime_type)
+        .header(header::CONTENT_LENGTH, transfer.file_meta.size)
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .body(body)
+        .map_err(internal_error)
+}
+
+fn safe_file_name(name: &str) -> String {
+    let name = Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let sanitized: String = name
+        .chars()
+        .map(|character| if character.is_control() || character == '"' { '_' } else { character })
+        .collect();
+    if sanitized.is_empty() {
+        "file".to_owned()
+    } else {
+        sanitized
     }
+}
 
-    let data = fs::read(&file_path).await.unwrap();
-    let mime = mime_type(&file_path);
+fn bad_request(error: impl std::fmt::Display) -> Response {
+    (StatusCode::BAD_REQUEST, error.to_string()).into_response()
+}
 
-    (StatusCode::OK, [(header::CONTENT_TYPE, mime)], data).into_response()
+fn internal_error(error: impl std::fmt::Display) -> Response {
+    eprintln!("transfer error: {error}");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }

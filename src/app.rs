@@ -74,4 +74,12 @@ impl AppState {
             None => false,
         }
     }
+
+    pub async fn add_transfer(&self, id: Uuid, transfer: TransferState) {
+        self.active_transfers.write().await.insert(id, Arc::new(RwLock::new(transfer)));
+    }
+
+    pub async fn get_transfer(&self, id: &Uuid) -> Option<Arc<RwLock<TransferState>>> {
+        self.active_transfers.read().await.get(id).cloned()
+    }
 }

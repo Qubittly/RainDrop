@@ -5,7 +5,7 @@ use tokio::io::{ AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReade
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use raindrop::{ AppState, ClientMessage, Data, ServerMessage, User, encode_message };
+use raindrop::{ AppState, ClientMessage, Data, ServerMessage, User, encode_message, transfer };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -13,6 +13,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(&server_addr).await?;
 
     let state = AppState::new();
+    let http_addr = std::env::var("HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1:8083".to_string());
+    let http_listener = TcpListener::bind(&http_addr).await?;
+    let http_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(http_listener, transfer::router(http_state)).await {
+            eprintln!("HTTP transfer server stopped: {error}");
+        }
+    });
+    println!("HTTP transfer server listening on {http_addr}");
+
     loop {
         let (socket, addr) = listener.accept().await?;
         let state = state.clone();

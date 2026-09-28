@@ -1,19 +1,25 @@
 use serde::{ Deserialize, Serialize };
-use std::collections::{ HashMap, HashSet };
+use std::collections::HashSet;
 use chrono::Utc;
 
 const MAX_MEMBERS: usize = 10;
 
 /// Represents metadata for a file in the network.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize)]
 pub struct FileMetadata {
-    name: String,
-    size: u64,
-    path: String,
-    mime_type: String,
-    owner: String,
-    shared_with: HashSet<String>,
-    timestamp: chrono::DateTime<Utc>,
+    pub name: String,
+    pub size: u64,
+    pub path: String,
+    pub mime_type: String,
+    pub owner: String,
+    pub shared_with: HashSet<String>,
+    pub timestamp: chrono::DateTime<Utc>,
+}
+
+impl FileMetadata {
+    pub fn new(name: String, size: u64, path: String, mime_type: String) -> Self {
+        Self { name, size, path, mime_type, timestamp: Utc::now(), ..Self::default() }
+    }
 }
 
 /// Represents a peer in the network.
@@ -164,6 +170,7 @@ impl User {
     }
 }
 
+#[derive(Clone)]
 pub struct Data {
     pub data: Vec<u8>,
 }
