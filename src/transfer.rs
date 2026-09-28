@@ -1,40 +1,47 @@
-use std::{ path::{ Path, PathBuf }, sync::Arc };
+use std::{ path::{ Path, PathBuf }, sync::{ Arc } };
 
 use axum::{
     Json,
     Router,
     body::Body,
-    extract::{ DefaultBodyLimit, Multipart, Path as AxumPath, State },
+    extract::{
+        DefaultBodyLimit,
+        Multipart,
+        Path as AxumPath,
+        State,
+        WebSocketUpgrade,
+        ws::Message,
+    },
     http::{ StatusCode, header },
     response::{ IntoResponse, Response },
     routing::{ get, post },
 };
 use serde::Serialize;
-use tokio::{ fs, io::AsyncWriteExt };
+use tokio::{ fs, io::AsyncWriteExt, sync::watch };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-use crate::{ AppState, FileMetadata };
+use crate::{ AppState, FileMetadata, Data, TransferStatus, TransferProgress };
 
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
 const UPLOAD_DIRECTORY: &str = "uploads";
 
+#[derive(Debug, Clone)]
 pub struct TransferState {
-    pub(crate) file_meta: FileMetadata,
+    pub file_meta: FileMetadata,
+    pub progress_tx: watch::Sender<TransferProgress>,
 }
 
 impl TransferState {
-    fn new(file_meta: FileMetadata) -> Self {
-        Self { file_meta }
+    fn new(id: Uuid, file_meta: FileMetadata) -> Self {
+        let (progress_tx, _) = watch::channel(TransferProgress {
+            id,
+            transferred: 0,
+            total: file_meta.size,
+            status: TransferStatus::Waiting,
+        });
+        Self { file_meta, progress_tx }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransferStatus {
-    Waiting,
-    Transferring,
-    Completed,
-    Failed,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,13 +55,13 @@ pub struct UploadResponse {
 /// Build the HTTP routes used for large-file transfers.
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/transfers", post(upload_file))
-        .route("/transfers/{id}", get(download_file))
+        .route("/transfers", post(upload_file_server))
+        .route("/transfers/{id}", get(download_file_server))
         .layer(DefaultBodyLimit::max((MAX_FILE_SIZE + 1024 * 1024) as usize))
         .with_state(state)
 }
 
-async fn upload_file(
+async fn upload_file_server(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart
 ) -> Result<Json<UploadResponse>, Response> {
@@ -65,11 +72,20 @@ async fn upload_file(
         let Some(raw_name) = field.file_name() else {
             continue;
         };
-        let file_name = safe_file_name(raw_name);
+        let file_name = sanitize_file_name(raw_name);
         let content_type = field.content_type().unwrap_or("application/octet-stream").to_owned();
         let id = Uuid::new_v4();
         let file_path = PathBuf::from(UPLOAD_DIRECTORY).join(format!("{id}.upload"));
         let mut file = fs::File::create(&file_path).await.map_err(internal_error)?;
+        let mut transfer_state = TransferState::new(
+                id,
+                FileMetadata::new(
+                file_name.clone(),
+                0,
+                file_path.to_string_lossy().into_owned(),
+                content_type.clone()
+            )
+        );
         let mut size = 0;
 
         while let Some(chunk) = field.chunk().await.map_err(bad_request)? {
@@ -81,16 +97,17 @@ async fn upload_file(
                 );
             }
             file.write_all(&chunk).await.map_err(internal_error)?;
+            transfer_state.progress_tx.send_modify(|p| {
+                p.transferred = size;
+            });
         }
         file.flush().await.map_err(internal_error)?;
 
-        let file_meta = FileMetadata::new(
-            file_name.clone(),
-            size,
-            file_path.to_string_lossy().into_owned(),
-            content_type
-        );
-        state.add_transfer(id, TransferState::new(file_meta)).await;
+        transfer_state.file_meta.size = size;
+        transfer_state.progress_tx.send_modify(|p| {
+            p.total = size;
+        });
+        state.add_transfer(id, transfer_state).await;
         upload = Some(UploadResponse {
             id,
             file_name,
@@ -107,7 +124,7 @@ async fn upload_file(
         )
 }
 
-async fn download_file(
+async fn download_file_server(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<Uuid>
 ) -> Result<Response, Response> {
@@ -131,7 +148,36 @@ async fn download_file(
         .map_err(internal_error)
 }
 
-fn safe_file_name(name: &str) -> String {
+async fn transfer_progress(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<Uuid>,
+    ws: WebSocketUpgrade
+) -> impl IntoResponse {
+    ws.on_upgrade(move |mut socket| async move {
+        let Some(transfer) = state.get_transfer(&id).await else {
+            return;
+        };
+        let mut rx = transfer.read().await.progress_tx.subscribe();
+        loop {
+            match rx.changed().await {
+                Ok(()) => {
+                    let progress = rx.borrow().clone();
+                    let Ok(payload) = serde_json::to_string(&progress) else {
+                        break;
+                    };
+                    if socket.send(Message::Text(payload.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn sanitize_file_name(name: &str) -> String {
     let name = Path::new(name)
         .file_name()
         .and_then(|name| name.to_str())

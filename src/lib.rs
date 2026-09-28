@@ -10,6 +10,8 @@ pub use types::{
     Data,
     ClientMessage,
     ServerMessage,
+    TransferStatus,
+    TransferProgress,
     encode_message,
 };
 pub use app::AppState;

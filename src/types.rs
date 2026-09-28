@@ -1,11 +1,12 @@
 use serde::{ Deserialize, Serialize };
 use std::collections::HashSet;
 use chrono::Utc;
+use uuid::Uuid;
 
 const MAX_MEMBERS: usize = 10;
 
 /// Represents metadata for a file in the network.
-#[derive(Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct FileMetadata {
     pub name: String,
     pub size: u64,
@@ -210,4 +211,20 @@ pub fn encode_message(message: ServerMessage) -> Result<Vec<u8>, serde_json::Err
     let mut data = serde_json::to_vec(&message)?;
     data.push(b'\n');
     Ok(data)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TransferProgress {
+    pub id: Uuid,
+    pub transferred: u64,
+    pub total: u64,
+    pub status: TransferStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum TransferStatus {
+    Waiting,
+    Transferring,
+    Completed,
+    Failed,
 }
