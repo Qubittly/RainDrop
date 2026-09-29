@@ -10,16 +10,16 @@ name = "raindrop"
 chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
-tokio-rustls = "0.26"
+tokio-rustls = "0.26.6"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-mdns-sd = "0.21"
+mdns-sd = "0.21.4"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 reqwest = { version = "0.13", features = ["multipart"] }
 uuid = {version = "1", features = ["v4", "serde"]}
 infer = "0.22"
-rustls = "0.23"
+rustls = "0.23.45"
 rcgen = "0.14"
 ratatui = "0.30"
-ratatui-image = { version = "11", default-features = false, features = ["image-defaults", "crossterm"] }
+ratatui-image = { version = "11.1.0", default-features = false, features = ["image-defaults", "crossterm"] }
 crossterm = "0.29"

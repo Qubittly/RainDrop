@@ -21,7 +21,7 @@ use tokio::{ fs, io::AsyncWriteExt, sync::watch };
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-use crate::{ AppState, FileMetadata, Data, TransferStatus, TransferProgress };
+use crate::{ AppState, FileMetadata, TransferStatus, TransferProgress };
 
 const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
 const UPLOAD_DIRECTORY: &str = "uploads";

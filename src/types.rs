@@ -1,9 +1,12 @@
 use serde::{ Deserialize, Serialize };
+use tokio::io::{AsyncRead, AsyncWrite};
 use std::collections::HashSet;
+use std::io;
 use chrono::Utc;
 use uuid::Uuid;
 
 const MAX_MEMBERS: usize = 10;
+const MAX_CHUNK_SIZE: usize = 64 * 1024; // 64KB
 
 /// Represents metadata for a file in the network.
 #[derive(Debug, Default, Clone, Serialize)]
@@ -171,18 +174,8 @@ impl User {
     }
 }
 
-#[derive(Clone)]
-pub struct Data {
-    pub data: Vec<u8>,
-}
 
-impl Data {
-    pub fn new(data: Vec<u8>) -> Self {
-        Self { data }
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     Identify {
         username: String,
@@ -193,7 +186,7 @@ pub enum ClientMessage {
     },
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub enum ServerMessage {
     Identified {
         username: String,
@@ -202,15 +195,104 @@ pub enum ServerMessage {
         from: String,
         message: String,
     },
+    IncomingTransfer {
+        id: Uuid,
+        from: String,
+        file_name: String,
+        size: u64,
+        addr: String,
+    },
     Error {
         message: String,
     },
 }
 
-pub fn encode_message(message: ServerMessage) -> Result<Vec<u8>, serde_json::Error> {
+pub fn encode_message<'a, T>(message: T) -> Result<Vec<u8>, serde_json::Error> 
+where
+    T: Serialize + Deserialize<'a>,
+{
     let mut data = serde_json::to_vec(&message)?;
     data.push(b'\n');
     Ok(data)
+}
+
+/// Messages over a direct peer-to-peer transfer connection
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TransferMessage {
+    Chunk { offset: u64, bytes: Vec<u8>},
+    Progress { transferred: u64 },
+    Complete,
+}
+
+/// Binary transfer frame: message type, payload length, then raw payload. This is big endian.
+/// Returns a binary frame which is a Vec<u8>.
+// Frame
+//  byte 0        bytes 1-8              bytes 9..N)
+// [type tag]  [payload length, u64]    [payload]
+
+// Payload
+//  offset (bytes 0 - 7)        file chunk data (bytes 8..N)
+// [8 bytes, big endian]        [remaining bytes]
+pub fn encode_transfer_message(message: &TransferMessage) -> Vec<u8> {
+    let (message_type, payload) = match message {
+        TransferMessage::Chunk { offset, bytes } => {
+            // The actual data starts from position 8 in the vec
+            let mut payload = Vec::with_capacity(8 + bytes.len());
+            payload.extend_from_slice(&offset.to_be_bytes());
+            payload.extend_from_slice(&bytes);
+            (0u8, payload)
+        }
+        TransferMessage::Progress { transferred } => (1u8, transferred.to_be_bytes().to_vec()),
+        TransferMessage::Complete => (2u8, Vec::new()),
+    };
+    let mut frame = Vec::with_capacity(9 + payload.len());
+    frame.push(message_type);
+    frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+/// Decode complete binary transfer frame.
+pub fn decode_transfer_message(frame: &[u8]) -> io::Result<TransferMessage> {
+    if frame.len() < 9 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "incomplete transfer frame"));
+    }
+
+    let mut length_bytes = [0u8; 8];
+    length_bytes.copy_from_slice(&frame[1..9]);
+    let payload_length = u64::from_be_bytes(length_bytes) as usize;
+    if frame.len() != 9 + payload_length {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid transfer frame length"));
+    }
+
+    let payload = &frame[9..];
+    match frame[0] {
+        0 if payload.len() >= 8 => {
+            let mut offset_bytes = [0u8; 8];
+            offset_bytes.copy_from_slice(&payload[..8]);
+            Ok(TransferMessage::Chunk {
+                offset: u64::from_be_bytes(offset_bytes),
+                bytes: payload[8..].to_vec(),
+            })
+        }
+        1 if payload.len() == 8 => {
+            let mut transferred_bytes = [0u8; 8];
+            transferred_bytes.copy_from_slice(payload);
+            Ok(TransferMessage::Progress {
+                transferred: u64::from_be_bytes(transferred_bytes),
+            })
+        }
+        2 if payload.is_empty() => Ok(TransferMessage::Complete),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid transfer message")),
+    }
+}
+
+pub async fn read_transfer_message<R>(reader: &mut R) -> io::Result<TransferMessage> 
+where 
+    R: AsyncRead + AsyncWrite + Unpin,
+{
+    // TODO: Create logic: this should assemble a complete frame for the decoder
+    Ok(TransferMessage::Complete)
 }
 
 #[derive(Debug, Clone, Serialize)]

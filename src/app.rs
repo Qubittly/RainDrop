@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{ RwLock, mpsc };
-use crate::types::{ Group, User, Data };
+use crate::types::{ Group, User };
 use crate::transfer::TransferState;
 use uuid::Uuid;
 
@@ -9,7 +9,7 @@ use uuid::Uuid;
 pub struct AppState {
     groups: RwLock<HashMap<String, Group>>,
     users: RwLock<HashMap<String, User>>,
-    clients: RwLock<HashMap<String, mpsc::Sender<Data>>>,
+    clients: RwLock<HashMap<String, mpsc::Sender<Vec<u8>>>>,
     active_transfers: Arc<RwLock<HashMap<Uuid, Arc<RwLock<TransferState>>>>>,
 }
 
@@ -51,26 +51,26 @@ impl AppState {
         users.insert(user.username.clone(), user);
     }
 
-    pub async fn register_client(&self, username: String, sender: mpsc::Sender<Data>) {
+    pub async fn register_client(&self, username: String, sender: mpsc::Sender<Vec<u8>>) {
         let mut clients = self.clients.write().await;
         clients.insert(username, sender);
     }
 
-    pub async fn remove_client(&self, username: &str, sender: &mpsc::Sender<Data>) {
+    pub async fn remove_client(&self, username: &str, sender: &mpsc::Sender<Vec<u8>>) {
         let mut clients = self.clients.write().await;
         if clients.get(username).is_some_and(|current| current.same_channel(sender)) {
             clients.remove(username);
         }
     }
 
-    pub async fn send_to(&self, username: &str, data: Vec<u8>) -> bool {
+    pub async fn send_to(&self, username: &str) -> bool {
         let sender = {
             let clients = self.clients.read().await;
             clients.get(username).cloned()
         };
 
         match sender {
-            Some(sender) => sender.send(Data::new(data)).await.is_ok(),
+            Some(sender) => sender.send(Vec::new()).await.is_ok(),
             None => false,
         }
     }

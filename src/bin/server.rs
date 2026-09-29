@@ -5,7 +5,7 @@ use tokio::io::{ AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReade
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
-use raindrop::{ AppState, ClientMessage, Data, ServerMessage, User, encode_message, transfer };
+use raindrop::{ AppState, ClientMessage, ServerMessage, User, encode_message, transfer };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -74,7 +74,7 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
         }
     };
 
-    let (sender, mut reciever) = mpsc::channel::<Data>(100);
+    let (sender, mut reciever) = mpsc::channel::<Vec<u8>>(100);
     state.register_client(username.clone(), sender.clone()).await;
     let mut user = match state.get_user(&username).await {
         Some(mut user) => {
@@ -92,19 +92,19 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
     // (Draiing the receiver channel) and writing to the socket in a loop
     let writer_task = tokio::spawn(async move {
         while let Some(outgoing) = reciever.recv().await {
-            if writer.write_all(&outgoing.data).await.is_err() {
+            if writer.write_all(&outgoing).await.is_err() {
                 break;
             }
         }
     });
 
     if
-        let Ok(data) = encode_message(ServerMessage::Identified {
+        let Ok(encoded) = encode_message(ServerMessage::Identified {
             username: username.clone(),
         })
     {
         // Send the identification confirmation message to the client
-        let _ = sender.send(Data { data }).await;
+        let _ = sender.send(encoded).await;
     }
 
     while let Ok(Some(line)) = lines.next_line().await {
@@ -112,11 +112,11 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
             Ok(message) => message,
             Err(_) => {
                 if
-                    let Ok(data) = encode_message(ServerMessage::Error {
+                    let Ok(encoded) = encode_message(ServerMessage::Error {
                         message: "invalid JSON message".to_string(),
                     })
                 {
-                    let _ = sender.send(Data { data }).await;
+                    let _ = sender.send(encoded).await;
                 }
                 continue;
             }
@@ -125,26 +125,26 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
         match message {
             ClientMessage::Identify { .. } => {
                 if
-                    let Ok(data) = encode_message(ServerMessage::Error {
+                    let Ok(encoded) = encode_message(ServerMessage::Error {
                         message: "the username can only be sent once".to_string(),
                     })
                 {
-                    let _ = sender.send(Data { data }).await;
+                    let _ = sender.send(encoded).await;
                 }
             }
             ClientMessage::Send { to, message } => {
-                let data = encode_message(ServerMessage::Message {
+                let encoded = encode_message(ServerMessage::Message {
                     from: username.clone(),
                     message,
                 });
-                if let Ok(data) = data {
-                    if !state.send_to(&to, data).await {
+                if let Ok(encoded) = encoded {
+                    if !state.send_to(&to).await {
                         if
                             let Ok(error) = encode_message(ServerMessage::Error {
                                 message: format!("user {to} is not connected"),
                             })
                         {
-                            let _ = sender.send(Data { data: error }).await;
+                            let _ = sender.send(error).await;
                         }
                     }
                 }

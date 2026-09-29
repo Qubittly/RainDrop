@@ -7,7 +7,6 @@ pub use types::{
     Peer,
     Group,
     User,
-    Data,
     ClientMessage,
     ServerMessage,
     TransferStatus,
