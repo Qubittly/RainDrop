@@ -1,8 +1,10 @@
 use std::error::Error;
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use raindrop::types::{TransferMessage, read_transfer_message};
 use tokio::io::{ AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use raindrop::{ AppState, ClientMessage, ServerMessage, User, encode_message, transfer };
@@ -34,48 +36,49 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
-    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static
+async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (reader, mut writer) = tokio::io::split(socket);
     let mut lines = BufReader::new(reader).lines();
 
     let username = match lines.next_line().await {
-        Ok(Some(line)) =>
-            match serde_json::from_str::<ClientMessage>(&line) {
-                Ok(ClientMessage::Identify { username }) => {
-                    if !username.trim().is_empty() {
-                        username
-                    } else {
-                        let error_message = ServerMessage::Error {
-                            message: "Username cannot be empty".to_string(),
-                        };
-                        let encoded = encode_message(error_message).unwrap();
-                        writer.write_all(&encoded).await.unwrap();
-                        return;
-                    }
-                }
-                _ => {
+        Ok(Some(line)) => match serde_json::from_str::<ClientMessage>(&line) {
+            Ok(ClientMessage::Identify { username }) => {
+                if !username.trim().is_empty() {
+                    username
+                } else {
                     let error_message = ServerMessage::Error {
-                        message: "The first line must be an identification message".to_string(),
+                        message: "Username cannot be empty".to_string(),
                     };
                     let encoded = encode_message(error_message).unwrap();
                     writer.write_all(&encoded).await.unwrap();
-                    return;
+                    return Ok(());
                 }
             }
+            _ => {
+                let error_message = ServerMessage::Error {
+                    message: "The first line must be an identification message".to_string(),
+                };
+                let encoded = encode_message(error_message).unwrap();
+                writer.write_all(&encoded).await.unwrap();
+                return Ok(());
+            }
+        },
         _ => {
             let error_message = ServerMessage::Error {
                 message: "Invalid identification message".to_string(),
             };
             let encoded = encode_message(error_message).unwrap();
             writer.write_all(&encoded).await.unwrap();
-            return;
+            return Ok(());
         }
     };
 
-    let (sender, mut reciever) = mpsc::channel::<Vec<u8>>(100);
+    let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(100);
     state.register_client(username.clone(), sender.clone()).await;
+    
     let mut user = match state.get_user(&username).await {
         Some(mut user) => {
             user.set_online(true);
@@ -89,20 +92,18 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
 
     // Spawn a task to handle outgoing messages to the client
     // This task will listen for messages sent to this client
-    // (Draiing the receiver channel) and writing to the socket in a loop
+    // (Draining the receiver channel) and writing to the socket in a loop
     let writer_task = tokio::spawn(async move {
-        while let Some(outgoing) = reciever.recv().await {
+        while let Some(outgoing) = receiver.recv().await {
             if writer.write_all(&outgoing).await.is_err() {
                 break;
             }
         }
     });
 
-    if
-        let Ok(encoded) = encode_message(ServerMessage::Identified {
-            username: username.clone(),
-        })
-    {
+    if let Ok(encoded) = encode_message(ServerMessage::Identified {
+        username: username.clone(),
+    }) {
         // Send the identification confirmation message to the client
         let _ = sender.send(encoded).await;
     }
@@ -111,11 +112,9 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
         let message = match serde_json::from_str::<ClientMessage>(&line) {
             Ok(message) => message,
             Err(_) => {
-                if
-                    let Ok(encoded) = encode_message(ServerMessage::Error {
-                        message: "invalid JSON message".to_string(),
-                    })
-                {
+                if let Ok(encoded) = encode_message(ServerMessage::Error {
+                    message: "invalid JSON message".to_string(),
+                }) {
                     let _ = sender.send(encoded).await;
                 }
                 continue;
@@ -124,11 +123,9 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
 
         match message {
             ClientMessage::Identify { .. } => {
-                if
-                    let Ok(encoded) = encode_message(ServerMessage::Error {
-                        message: "the username can only be sent once".to_string(),
-                    })
-                {
+                if let Ok(encoded) = encode_message(ServerMessage::Error {
+                    message: "the username can only be sent once".to_string(),
+                }) {
                     let _ = sender.send(encoded).await;
                 }
             }
@@ -138,12 +135,10 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
                     message,
                 });
                 if let Ok(encoded) = encoded {
-                    if !state.send_to(&to).await {
-                        if
-                            let Ok(error) = encode_message(ServerMessage::Error {
-                                message: format!("user {to} is not connected"),
-                            })
-                        {
+                    if !state.send_to(&to, encoded).await {
+                        if let Ok(error) = encode_message(ServerMessage::Error {
+                            message: format!("user {to} is not connected"),
+                        }) {
                             let _ = sender.send(error).await;
                         }
                     }
@@ -151,6 +146,7 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
             }
         }
     }
+    
     // Stop accepting messages from the client and close the connection
     state.remove_client(&username, &sender).await;
 
@@ -159,4 +155,29 @@ async fn handle_connection<S>(socket: S, addr: SocketAddr, state: Arc<AppState>)
 
     drop(sender);
     let _ = writer_task.await;
+
+    Ok(())
+}
+
+async fn handle_transfer<S>(mut stream: S) -> io::Result<()> 
+    where S: AsyncRead + AsyncWrite + Unpin + Send + 'static
+{
+    loop {
+        let message = read_transfer_message(&mut stream).await?;
+
+        match message {
+            TransferMessage::Chunk { offset, bytes } => {
+                
+            }
+            TransferMessage::Progress { transferred } => {
+
+            }
+            TransferMessage::Complete => {
+
+                break;
+            }
+        }
+        
+    }
+    Ok(())
 }

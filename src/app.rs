@@ -63,14 +63,14 @@ impl AppState {
         }
     }
 
-    pub async fn send_to(&self, username: &str) -> bool {
+    pub async fn send_to(&self, username: &str, encoded: Vec<u8>) -> bool {
         let sender = {
             let clients = self.clients.read().await;
             clients.get(username).cloned()
         };
 
         match sender {
-            Some(sender) => sender.send(Vec::new()).await.is_ok(),
+            Some(sender) => sender.send(encoded).await.is_ok(),
             None => false,
         }
     }
