@@ -1,5 +1,6 @@
 use serde::{ Deserialize, Serialize };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{ AsyncRead, AsyncReadExt, AsyncWrite };
+use tokio::time::{ timeout, Duration };
 use std::collections::HashSet;
 use std::io;
 use chrono::Utc;
@@ -7,6 +8,7 @@ use uuid::Uuid;
 
 const MAX_MEMBERS: usize = 10;
 const MAX_CHUNK_SIZE: usize = 64 * 1024; // 64KB
+const TRANSFER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Represents metadata for a file in the network.
 #[derive(Debug, Default, Clone, Serialize)]
@@ -69,7 +71,7 @@ impl Group {
         Group {
             name,
             owner,
-            members: HashSet::new(),
+            members: HashSet::with_capacity(MAX_MEMBERS),
             pending_requests: HashSet::new(),
             files: Vec::new(),
         }
@@ -174,7 +176,6 @@ impl User {
     }
 }
 
-
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     Identify {
@@ -207,9 +208,8 @@ pub enum ServerMessage {
     },
 }
 
-pub fn encode_message<'a, T>(message: T) -> Result<Vec<u8>, serde_json::Error> 
-where
-    T: Serialize + Deserialize<'a>,
+pub fn encode_message<'a, T>(message: T) -> Result<Vec<u8>, serde_json::Error>
+    where T: Serialize + Deserialize<'a>
 {
     let mut data = serde_json::to_vec(&message)?;
     data.push(b'\n');
@@ -219,36 +219,41 @@ where
 /// Messages over a direct peer-to-peer transfer connection
 #[derive(Debug, Serialize, Deserialize)]
 pub enum TransferMessage {
-    Chunk { offset: u64, bytes: Vec<u8>},
-    Progress { transferred: u64 },
+    Chunk {
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    Progress {
+        transferred: u64,
+    },
     Complete,
 }
 
-/// Binary transfer frame: message type, payload length, then raw payload. This is big endian.
+/// Binary transfer frame: message type, chunk length, then raw chunk. This is big endian.
 /// Returns a binary frame which is a Vec<u8>.
 // Frame
 //  byte 0        bytes 1-8              bytes 9..N)
-// [type tag]  [payload length, u64]    [payload]
+// [type tag]  [chunk length, u64]    [chunk]
 
-// Payload
+// Chunk
 //  offset (bytes 0 - 7)        file chunk data (bytes 8..N)
 // [8 bytes, big endian]        [remaining bytes]
 pub fn encode_transfer_message(message: &TransferMessage) -> Vec<u8> {
-    let (message_type, payload) = match message {
+    let (message_type, chunk) = match message {
         TransferMessage::Chunk { offset, bytes } => {
             // The actual data starts from position 8 in the vec
-            let mut payload = Vec::with_capacity(8 + bytes.len());
-            payload.extend_from_slice(&offset.to_be_bytes());
-            payload.extend_from_slice(&bytes);
-            (0u8, payload)
+            let mut chunk = Vec::with_capacity(8 + bytes.len());
+            chunk.extend_from_slice(&offset.to_be_bytes());
+            chunk.extend_from_slice(&bytes);
+            (0u8, chunk)
         }
         TransferMessage::Progress { transferred } => (1u8, transferred.to_be_bytes().to_vec()),
         TransferMessage::Complete => (2u8, Vec::new()),
     };
-    let mut frame = Vec::with_capacity(9 + payload.len());
+    let mut frame = Vec::with_capacity(9 + chunk.len());
     frame.push(message_type);
-    frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    frame.extend_from_slice(&payload);
+    frame.extend_from_slice(&(chunk.len() as u64).to_be_bytes());
+    frame.extend_from_slice(&chunk);
     frame
 }
 
@@ -260,39 +265,82 @@ pub fn decode_transfer_message(frame: &[u8]) -> io::Result<TransferMessage> {
 
     let mut length_bytes = [0u8; 8];
     length_bytes.copy_from_slice(&frame[1..9]);
-    let payload_length = u64::from_be_bytes(length_bytes) as usize;
-    if frame.len() != 9 + payload_length {
+    let chunk_length = u64::from_be_bytes(length_bytes) as usize;
+    if frame.len() != 9 + chunk_length {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid transfer frame length"));
     }
 
-    let payload = &frame[9..];
+    let chunk = &frame[9..];
     match frame[0] {
-        0 if payload.len() >= 8 => {
+        0 if chunk.len() >= 8 => {
             let mut offset_bytes = [0u8; 8];
-            offset_bytes.copy_from_slice(&payload[..8]);
+            offset_bytes.copy_from_slice(&chunk[..8]);
             Ok(TransferMessage::Chunk {
                 offset: u64::from_be_bytes(offset_bytes),
-                bytes: payload[8..].to_vec(),
+                bytes: chunk[8..].to_vec(),
             })
         }
-        1 if payload.len() == 8 => {
+        1 if chunk.len() == 8 => {
             let mut transferred_bytes = [0u8; 8];
-            transferred_bytes.copy_from_slice(payload);
+            transferred_bytes.copy_from_slice(chunk);
             Ok(TransferMessage::Progress {
                 transferred: u64::from_be_bytes(transferred_bytes),
             })
         }
-        2 if payload.is_empty() => Ok(TransferMessage::Complete),
+        2 if chunk.is_empty() => Ok(TransferMessage::Complete),
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, "invalid transfer message")),
     }
 }
 
-pub async fn read_transfer_message<R>(reader: &mut R) -> io::Result<TransferMessage> 
-where 
-    R: AsyncRead + AsyncWrite + Unpin,
+pub async fn read_transfer_message<S>(stream: &mut S) -> io::Result<TransferMessage>
+    where S: AsyncRead + AsyncWrite + Unpin
 {
-    // TODO: Create logic: this should assemble a complete frame for the decoder
-    Ok(TransferMessage::Complete)
+    let mut header = [0u8; 9];
+    match timeout(TRANSFER_READ_TIMEOUT, stream.read_exact(&mut header)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed while reading transfer header",
+            ));
+        }
+        Ok(Err(error)) => return Err(error),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out while reading transfer header",
+            ));
+        }
+    }
+
+    let mut length_bytes = [0u8; 8];
+    length_bytes.copy_from_slice(&header[1..9]);
+    let chunk_length = u64::from_be_bytes(length_bytes) as usize;
+
+    if chunk_length <= MAX_CHUNK_SIZE {
+        let mut frame = Vec::with_capacity(9 + chunk_length);
+        frame.extend_from_slice(&header);
+        frame.resize(9 + chunk_length, 0);
+        match timeout(TRANSFER_READ_TIMEOUT, stream.read_exact(&mut frame[9..])).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed while reading transfer payload",
+                ));
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out while reading transfer payload",
+                ));
+            }
+        }
+        decode_transfer_message(&frame)
+    } else {
+        Err(io::Error::new(io::ErrorKind::InvalidData, "chunk load maximum size exceeded"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
